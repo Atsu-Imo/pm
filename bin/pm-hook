@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# pm-hook — 子セッションの Claude Code フック
+#
+# 使い方: pm-hook <案件名> <イベント名>   （標準入力に Claude Code のフック JSON）
+#
+# SessionStart     課題ファイルと引き継ぎメモを読み込ませ、「報告だけして指示を待つ」よう伝える
+# UserPromptSubmit 圧縮直後なら引き継ぎメモの確認を促す
+# PreCompact       手動 /compact で引き継ぎメモが古ければ一度だけ止めて更新を促す。自動圧縮は止めない
+# Stop             引き継ぎメモが一定時間更新されていなければ、終了前に更新を促す（1回だけ）
+
+# shellcheck disable=SC1091
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/pm-lib.sh"
+
+name="${1:-}"; event="${2:-}"
+[ -n "$name" ] && [ -n "$event" ] || exit 0
+input="$(cat 2>/dev/null || true)"
+
+status_file="$PM_STATUS_DIR/$name.md"
+handoff_file="$PM_HANDOFF_DIR/$name.md"
+flag_compact="$PM_STATE_DIR/$name.compact-pending"
+mkdir -p "$PM_STATE_DIR" 2>/dev/null || true
+
+json_field() {  # json_field <key> : 文字列か真偽値の値を取り出す（依存なし）
+  printf '%s' "$input" | tr -d '\n' | sed -n -E "s/.*\"$1\"[[:space:]]*:[[:space:]]*(\"([^\"]*)\"|(true|false|null)).*/\2\3/p" | head -n1
+}
+
+json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "$(sed 's/"/\\"/g' | tr '\n' ' ')"; }
+
+minutes_since() {  # ファイルの最終更新からの分数
+  local f="$1" now m
+  [ -f "$f" ] || { echo 999999; return; }
+  now="$(date +%s)"; m="$(stat -c %Y "$f")"
+  echo $(( (now - m) / 60 ))
+}
+
+case "$event" in
+  SessionStart)
+    cat <<EOF
+[pm] あなたは案件「$name」の子セッションです。以下は起動時点のファイルの内容です。
+
+## 課題ファイル（$status_file）
+$(cat "$status_file" 2>/dev/null || echo '(読めません)')
+
+## 引き継ぎメモ（$handoff_file）
+$(cat "$handoff_file" 2>/dev/null || echo '(読めません)')
+
+## 起動時の指示
+- 上の内容から現在の状況を3〜5行で短く報告し、そのあと指示を待ってください。
+- 読み込んだだけを理由に、未完了タスクの作業を始めないでください。
+- 報告には絶対パスや案件外の情報を含めないでください。
+EOF
+    ;;
+
+  UserPromptSubmit)
+    touch "$PM_STATE_DIR/$name.lastprompt"
+    if [ -f "$flag_compact" ]; then
+      rm -f "$flag_compact"
+      echo "[pm] 直前にコンテキストの圧縮が行われました。引き継ぎメモ（$handoff_file）が現在の状態と合っているか確認し、ずれていれば更新してから続けてください。"
+    fi
+    ;;
+
+  PreCompact)
+    trigger="$(json_field trigger)"
+    if [ "$trigger" = "manual" ] && [ ! -f "$flag_compact" ] && [ "$(minutes_since "$handoff_file")" -ge 5 ]; then
+      touch "$flag_compact"
+      echo "[pm] 引き継ぎメモが5分以上更新されていません。先に引き継ぎメモと課題ファイルを更新してから、もう一度 /compact を実行してください（2回目は止めません）。" >&2
+      exit 2
+    fi
+    touch "$flag_compact"
+    ;;
+
+  Stop)
+    [ "$(json_field stop_hook_active)" = "true" ] && exit 0
+    if [ "$(minutes_since "$handoff_file")" -ge "$PM_HANDOFF_STALE_MIN" ]; then
+      msg="[pm] 引き継ぎメモが ${PM_HANDOFF_STALE_MIN} 分以上更新されていません。この応答で決定事項・未解決の問題・次にやることが変わっていれば $handoff_file と $status_file を更新してから終了してください。変わっていなければ、メモの『更新』行の時刻だけ更新して終了してください。"
+      printf '{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext":%s}}\n' "$(printf '%s' "$msg" | json_escape)"
+    fi
+    ;;
+esac
+exit 0

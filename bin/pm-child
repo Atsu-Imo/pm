@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# pm-child — 案件の子セッション（claude）を起動する
+#
+# 使い方: pm-child <案件名> [--resume]
+#
+# 案件のパスは対応表から読み、cd してから claude を exec する。
+# この方法だと、他ユーザーから見える /proc/<pid>/cmdline にパスが載らない
+# （cwd と環境変数は同じ UID にしか見えない）。
+
+# shellcheck disable=SC1091
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/pm-lib.sh"
+
+name="${1:-}"
+[ -n "$name" ] || pm_die "使い方: pm-child <案件名> [--resume]"
+resume=""
+[ "${2:-}" = "--resume" ] && resume=1
+
+pm_validate_name "$name"
+path="$(pm_ws_path "$name")" || pm_die "未登録の案件です: $name"
+[ -d "$path" ] || pm_die "案件 '$name' のディレクトリがありません（対応表を確認してください）"
+
+pm_ensure_status_file "$name"
+pm_ensure_handoff_file "$name"
+pm_generate_child_files "$name"
+gen="$PM_GENERATED_DIR/$name"
+
+args=(
+  --name "$name"
+  --append-system-prompt-file "$gen/rules.md"
+  --settings "$gen/settings.json"
+  --add-dir "$PM_STATUS_DIR"
+  --add-dir "$PM_HANDOFF_DIR"
+)
+model="$(pm_ws_model "$name")"
+if [ -n "$model" ]; then
+  args+=(--model "$model")
+fi
+if [ -n "$resume" ]; then
+  args+=(--resume "$name")
+fi
+
+cd "$path" || exit 1
+printf '案件 %s の子セッションを起動します\n' "$name"
+exec "$PM_CLAUDE_BIN" "${args[@]}"

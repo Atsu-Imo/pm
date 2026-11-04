@@ -1,0 +1,20 @@
+#!/bin/bash
+# pm-parent-run — 親ユーザーで claude を起動するためだけのラッパ
+#
+# install.sh が root 所有・書き込み不可で /usr/local/bin に置き、
+# sudoers では利用者がこのファイルを親ユーザーとして実行することだけを許可する。
+# 受け付ける引数は --resume と --check のみ。それ以外は何もしない。
+
+set -u
+export PATH="$HOME/.local/bin:$PATH"
+case "${1:-}" in
+  "")       cd ~/pm || exit 1; exec claude --name parent ;;
+  --resume) cd ~/pm || exit 1; exec claude --name parent --resume parent ;;
+  --check)
+    rc=0
+    command -v claude >/dev/null || { echo "claude が親ユーザーに入っていません" >&2; rc=1; }
+    [ -d ~/pm ] || { echo "親ユーザーの ~/pm がありません" >&2; rc=1; }
+    [ -r ~/pm/CLAUDE.md ] || { echo "親ユーザーから ~/pm/CLAUDE.md が読めません" >&2; rc=1; }
+    exit $rc ;;
+  *) echo "pm-parent-run: 不明な引数" >&2; exit 2 ;;
+esac

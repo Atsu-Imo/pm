@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# pm — 複数案件の Claude Code セッションを tmux で同時に管理する
+#
+# 使い方:
+#   pm init [--resume]              tmux セッション pm を作成（または接続）
+#   pm add-workspace <名前> <パス> [--model <モデル>]
+#                                   案件を登録する
+#   pm set-model <名前> <モデル|default>
+#                                   その案件の子が使うモデルを変える（次の起動から有効）
+#   pm status [--brief|--all]       全案件の課題一覧（パスは出さない）。既定で未完了タスクを展開
+#   pm restart <名前>               その案件の子だけを起動し直す
+#   pm list                         登録済みの案件名を表示する
+#   pm check                        前提条件を点検する
+#   pm dispatch                     （内部用）inbox を監視して子ペインへ入力する
+#   pm version / pm help
+
+# shellcheck disable=SC1091
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/pm-lib.sh"
+
+usage() {
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ---------------------------------------------------------------- 起動コマンド
+# 親ペインで実行するコマンド文字列。案件のパスは一切含めない。
+parent_command() {
+  if [ -n "$PM_PARENT_USER" ]; then
+    # 別ユーザー構成: 親ユーザーのホームにある ~/pm（共有ディレクトリへの symlink）で起動する
+    printf 'sudo -n -H -u %q %q%s' "$PM_PARENT_USER" "$PM_PARENT_RUN" "${PM_RESUME:+ --resume}"
+  else
+    # 同一ユーザー構成: 案件パスの deny を生成した設定を --settings で渡す
+    printf 'bash -lc %q' \
+      "cd $(printf %q "$PM_SHARED") && exec $(printf %q "$PM_CLAUDE_BIN") --name parent --settings $(printf %q "$PM_GENERATED_DIR/parent.settings.json")${PM_RESUME:+ --resume parent}"
+  fi
+}
+
+child_command() {
+  local name="$1"
+  printf 'pm-child %q%s' "$name" "${PM_RESUME:+ --resume}"
+}
+
+status_command() {
+  printf 'watch -t -n %q pm status' "$PM_STATUS_INTERVAL"
+}
+
+# ---------------------------------------------------------------- tmux 構築
+# 案件の通し番号（0 始まり）からウィンドウ名を決める
+window_for_index() {
+  local i="$1"
+  if [ "$i" -lt "$PM_FIRST_WINDOW_CHILDREN" ]; then
+    echo main
+  else
+    echo "ws-$(( (i - PM_FIRST_WINDOW_CHILDREN) / PM_CHILDREN_PER_WINDOW + 2 ))"
+  fi
+}
+
+index_of_workspace() {
+  local name="$1" i=0 n
+  for n in $(pm_ws_names); do
+    [ "$n" = "$name" ] && { echo "$i"; return 0; }
+    i=$((i + 1))
+  done
+  return 1
+}
+
+apply_window_options() {
+  local win="$1"
+  t set-option -w -t "=$PM_SESSION:$win" pane-border-status top
+  # claude は端末タイトルでペイン名を上書きするので、独自オプション @pm_title を枠に出す
+  t set-option -w -t "=$PM_SESSION:$win" pane-border-format ' #{@pm_title} '
+  t set-option -w -t "=$PM_SESSION:$win" remain-on-exit on
+}
+
+apply_session_options() {
+  # set-option のセッション指定は "=名前" を受け付けない（tmux 3.4）。末尾コロンでセッションを指す
+  t set-option -t "$PM_SESSION:" mouse on
+  t set-option -t "$PM_SESSION:" history-limit 20000
+}
+
+# 子ペインが権限確認などの選択待ちに見えるか（画面の末尾の文字列で判定する）
+pane_waiting_for_choice() {
+  local id="$1" screen
+  screen="$(t capture-pane -p -t "$id" 2>/dev/null | tail -n 20 || true)"
+  grep -q -E 'Do you want|Allow|Yes, |❯ 1\.|Esc to cancel' <<<"$screen"
+}
+
+# セッション内で指定コマンドを起動したペインを探す（ペイン対応表が失われたときの保険）
+find_pane_by_command() {
+  local cmd="$1" line id start
+  # awk -v はバックスラッシュを解釈するので、bash で素直に比較する
+  while IFS= read -r line; do
+    id="${line%%$'\t'*}"; start="${line#*$'\t'}"
+    if [ "$start" = "$cmd" ]; then echo "$id"; return 0; fi
+  done < <(t list-panes -s -t "=$PM_SESSION" -F '#{pane_id}\t#{pane_start_command}' 2>/dev/null)
+  return 0
+}
+
+# 子ペインを追加する。すでに生きているペインがあれば何もしない。
+add_child_pane() {
+  local name="$1" idx win id
+  id="$(pm_pane_id "$name" 2>/dev/null || true)"
+  if [ -z "$id" ] || ! pm_pane_alive "$id"; then
+    id="$(find_pane_by_command "$(child_command "$name")")"
+    [ -n "$id" ] && pm_pane_record "$name" "$id"
+  fi
+  if [ -n "$id" ] && pm_pane_alive "$id"; then
+    if [ "$(t display -p -t "$id" '#{pane_dead}')" = "1" ]; then
+      t respawn-pane -k -t "$id" "$(child_command "$name")"
+    fi
+    return 0
+  fi
+  idx="$(index_of_workspace "$name")"
+  win="$(window_for_index "$idx")"
+  if t list-windows -t "=$PM_SESSION" -F '#{window_name}' | grep -qx -- "$win"; then
+    id="$(t split-window -d -P -F '#{pane_id}' -t "=$PM_SESSION:$win")"
+  else
+    id="$(t new-window -d -P -F '#{pane_id}' -t "=$PM_SESSION" -n "$win")"
+    apply_window_options "$win"
+  fi
+  t set-option -p -t "$id" @pm_title "子：$name"
+  t respawn-pane -k -t "$id" "$(child_command "$name")"
+  t select-layout -t "=$PM_SESSION:$win" tiled
+  pm_pane_record "$name" "$id"
+}
+
+create_session() {
+  local parent_id status_id dispatch_id name
+  mkdir -p "$PM_STATE_DIR"
+  : > "$PM_PANES"
+  [ -z "$PM_PARENT_USER" ] && pm_generate_parent_single_user_settings
+
+  # 先にシェルでペインを作り remain-on-exit を効かせてから、コマンドに差し替える。
+  # こうしないと、親が起動直後に落ちたときペインごと消えて原因が見えない。
+  parent_id="$(t new-session -d -P -F '#{pane_id}' -s "$PM_SESSION" -n main -x 220 -y 60)"
+  apply_session_options
+  apply_window_options main
+  t set-option -p -t "$parent_id" @pm_title '親AI'
+  pm_pane_record parent "$parent_id"
+  t respawn-pane -k -t "$parent_id" "$(parent_command)"
+
+  status_id="$(t split-window -d -P -F '#{pane_id}' -h -t "$parent_id" "$(status_command)")"
+  t set-option -p -t "$status_id" @pm_title '課題一覧'
+  pm_pane_record status "$status_id"
+
+  for name in $(pm_ws_names); do
+    add_child_pane "$name"
+  done
+
+  # inbox 監視は別ウィンドウに置く（通常は表示しない）
+  dispatch_id="$(t new-window -d -P -F '#{pane_id}' -t "=$PM_SESSION" -n sys)"
+  apply_window_options sys
+  t set-option -p -t "$dispatch_id" @pm_title 'inbox 監視'
+  pm_pane_record sys "$dispatch_id"
+  t respawn-pane -k -t "$dispatch_id" 'pm dispatch'
+
+  t select-window -t "=$PM_SESSION:main"
+  t select-pane -t "$parent_id"
+}
+
+attach_session() {
+  if [ -n "${TMUX:-}" ]; then
+    t switch-client -t "=$PM_SESSION"
+  else
+    t attach-session -t "=$PM_SESSION"
+  fi
+}
+
+# ---------------------------------------------------------------- サブコマンド
+cmd_init() {
+  PM_RESUME=""
+  case "${1:-}" in
+    --resume) PM_RESUME=1 ;;
+    "") ;;
+    *) pm_die "init の引数は --resume だけです" ;;
+  esac
+  command -v "$PM_TMUX_BIN" >/dev/null || pm_die "tmux が見つかりません"
+  [ -d "$PM_SHARED" ] || pm_die "$PM_SHARED がありません。install.sh を先に実行してください"
+  mkdir -p "$PM_STATUS_DIR" "$PM_INBOX_DIR" 2>/dev/null || true
+  pm_write_workspace_list
+  for n in $(pm_ws_names); do
+    pm_ensure_status_file "$n"
+    pm_ensure_handoff_file "$n"
+    pm_generate_child_files "$n"
+  done
+  if pm_session_exists; then
+    local pid
+    pid="$(pm_pane_id parent 2>/dev/null || true)"
+    if [ -z "$pid" ] || ! pm_pane_alive "$pid"; then
+      pid="$(find_pane_by_command "$(parent_command)")"
+      [ -n "$pid" ] && pm_pane_record parent "$pid"
+    fi
+    if [ -z "$pid" ]; then
+      pm_die "セッション '$PM_SESSION' はありますが pm が作ったものではないか、作成途中で失敗しています。tmux kill-session -t $PM_SESSION のあと再実行してください"
+    fi
+    [ -n "$PM_RESUME" ] && pm_warn "セッション pm は起動中なので --resume は無視して接続します"
+    for n in $(pm_ws_names); do add_child_pane "$n"; done
+  else
+    create_session
+  fi
+  attach_session
+}
+
+cmd_add_workspace() {
+  local name="" path="" model="" abs
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model) [ $# -ge 2 ] || pm_die "--model にはモデル名が要ります"; model="$2"; shift 2 ;;
+      --*) pm_die "不明なオプション: $1" ;;
+      *) if [ -z "$name" ]; then name="$1"; elif [ -z "$path" ]; then path="$1"; else pm_die "引数が多すぎます"; fi; shift ;;
+    esac
+  done
+  [ -n "$name" ] && [ -n "$path" ] || pm_die "使い方: pm add-workspace <名前> <パス> [--model <モデル>]"
+  pm_validate_name "$name"
+  [ -n "$model" ] && pm_validate_model "$model"
+  [ -d "$path" ] || pm_die "ディレクトリがありません: $path"
+  abs="$(cd "$path" && pwd -P)"
+  pm_validate_path "$abs"
+  mkdir -p "$PM_CONFIG_DIR"
+  chmod 700 "$PM_CONFIG_DIR" 2>/dev/null || true
+  touch "$PM_WORKSPACES"
+  chmod 600 "$PM_WORKSPACES" 2>/dev/null || true
+  if pm_ws_exists "$name"; then
+    if [ "$(pm_ws_path "$name")" = "$abs" ]; then
+      pm_info "案件 '$name' は登録済みです"
+    else
+      pm_die "案件 '$name' は別のパスで登録済みです。別の名前を使うか、対応表を手で直してください: $PM_WORKSPACES"
+    fi
+  else
+    if [ -n "$model" ]; then
+      printf '%s\t%s\t%s\n' "$name" "$abs" "$model" >> "$PM_WORKSPACES"
+    else
+      printf '%s\t%s\n' "$name" "$abs" >> "$PM_WORKSPACES"
+    fi
+    pm_info "案件 '$name' を登録しました${model:+（モデル: $model）}"
+    model=""
+  fi
+  if [ -n "$model" ]; then
+    pm_ws_set_model "$name" "$model"
+    pm_info "案件 '$name' のモデルを $model にしました"
+  fi
+  pm_ensure_status_file "$name"
+  pm_ensure_handoff_file "$name"
+  pm_write_workspace_list
+  # 他の子の deny 一覧も変わるので全員分を生成し直す
+  for n in $(pm_ws_names); do pm_generate_child_files "$n"; done
+  [ -z "$PM_PARENT_USER" ] && pm_generate_parent_single_user_settings
+  if pm_session_exists; then
+    PM_RESUME=""
+    add_child_pane "$name"
+    pm_info "セッション pm にペインを追加しました"
+  fi
+}
+
+cmd_set_model() {
+  [ $# -eq 2 ] || pm_die "使い方: pm set-model <名前> <モデル|default>"
+  local name="$1" model="$2"
+  pm_ws_exists "$name" || pm_die "未登録の案件です: $name"
+  if [ "$model" = default ]; then
+    pm_ws_set_model "$name" ""
+    pm_info "案件 '$name' のモデル指定を外しました（Claude Code の既定に従います）。次の起動から有効です"
+  else
+    pm_validate_model "$model"
+    pm_ws_set_model "$name" "$model"
+    pm_info "案件 '$name' のモデルを $model にしました。次の起動（pm restart $name）から有効です"
+  fi
+}
+
+# 課題ファイルを読んで一覧を出す。既定で未完了タスクを展開する（--brief で件数だけ）。
+#   - [ ] #3 ログ出力を整理する
+#     期限：2026-11-10
+#     直近：11-04 15:20 api/ 配下の出力箇所を洗い出した
+cmd_status() {
+  local brief="" all="" name f model today
+  for a in "$@"; do
+    case "$a" in
+      --brief) brief=1 ;;
+      --all) all=1 ;;
+      *) pm_die "status の引数は --brief か --all です" ;;
+    esac
+  done
+  today="$(date +%Y-%m-%d)"
+  printf '案件  状態  未完了/完了  更新  モデル\n'
+  for name in $(pm_ws_names); do
+    f="$PM_STATUS_DIR/$name.md"
+    model="$(pm_ws_model "$name")"
+    if [ ! -r "$f" ]; then
+      printf '%-14s %s\n' "$name" '(課題ファイルなし)'
+      continue
+    fi
+    awk -v name="$name" -v model="${model:-既定}" -v today="$today" -v brief="$brief" -v all="$all" '
+      function flush() {
+        if (cur == "") return
+        tasks[n] = cur; dl[n] = cur_dl; rc[n] = cur_rc; done_[n] = cur_done; n++
+        cur = ""; cur_dl = ""; cur_rc = ""
+      }
+      function fmt_dl(d,   y, m, dd) {
+        if (d == "" || d == "なし") return "    --"
+        if (match(d, /^[0-9]{4}-[0-9]{2}-[0-9]{2}/)) {
+          y = substr(d, 1, 10)
+          m = substr(d, 6, 2); dd = substr(d, 9, 2)
+          return (y < today ? "!" : " ") m "/" dd
+        }
+        return " " d
+      }
+      BEGIN { n = 0; cur = "" }
+      /^状態[:：]/ { state = $0; sub(/^状態[:：] */, "", state); next }
+      /^更新[:：]/ { updated = $0; sub(/^更新[:：] */, "", updated); next }
+      /^[ \t]*- \[[ xX]\] / {
+        flush()
+        cur_done = ($0 ~ /- \[[xX]\]/) ? 1 : 0
+        cur = $0; sub(/^[ \t]*- \[[ xX]\] */, "", cur)
+        if (cur_done) total++; else open++
+        next
+      }
+      /^[ \t]+期限[:：]/ && cur != "" { cur_dl = $0; sub(/^[ \t]+期限[:：] */, "", cur_dl); next }
+      /^[ \t]+直近[:：]/ && cur != "" { cur_rc = $0; sub(/^[ \t]+直近[:：] */, "", cur_rc); next }
+      END {
+        flush()
+        printf "%-14s %-8s %2d/%-2d  %-16s %s\n", name, (state == "" ? "-" : state), open, total, (updated == "" ? "-" : updated), model
+        if (brief) exit
+        for (i = 0; i < n; i++) {
+          if (done_[i] && !all) continue
+          printf "  %s %s  %s\n", (done_[i] ? "[x]" : "[ ]"), fmt_dl(dl[i]), tasks[i]
+          if (rc[i] != "") printf "             直近 %s\n", rc[i]
+        }
+      }' "$f"
+  done
+}
+
+cmd_list() { pm_ws_names; }
+
+cmd_restart() {
+  [ $# -eq 1 ] || pm_die "使い方: pm restart <名前>"
+  local name="$1" id handoff before waited=0
+  pm_ws_exists "$name" || pm_die "未登録の案件です: $name"
+  pm_session_exists || pm_die "セッション pm が起動していません"
+  id="$(pm_pane_id "$name" 2>/dev/null || true)"
+  [ -n "$id" ] && pm_pane_alive "$id" || pm_die "案件 '$name' のペインが見つかりません。pm init で再作成してください"
+  handoff="$PM_HANDOFF_DIR/$name.md"
+  pm_ensure_handoff_file "$name"
+  before="$(stat -c %Y "$handoff")"
+
+  if [ "$(t display -p -t "$id" '#{pane_dead}')" != "1" ]; then
+    pane_waiting_for_choice "$id" && pm_die "子 '$name' は権限確認などの選択待ちです。先にそのペインで応答してから再実行してください"
+    pm_info "子 '$name' に引き継ぎメモの更新を依頼しています（最大 ${PM_RESTART_WAIT} 秒待ちます）"
+    t send-keys -t "$id" -l -- "【pm restart】このセッションを再起動します。引き継ぎメモと課題ファイルを現在の状態に更新してください。作業は始めないでください。"
+    t send-keys -t "$id" Enter
+    while [ "$waited" -lt "$PM_RESTART_WAIT" ]; do
+      sleep 2; waited=$((waited + 2))
+      [ "$(stat -c %Y "$handoff")" -gt "$before" ] && break
+    done
+    if [ "$(stat -c %Y "$handoff")" -le "$before" ]; then
+      pm_warn "引き継ぎメモが更新されませんでした。そのまま再起動します"
+    else
+      sleep 3  # 課題ファイル側の書き込みが終わるのを少し待つ
+    fi
+  fi
+  pm_generate_child_files "$name"
+  PM_RESUME=""
+  t respawn-pane -k -t "$id" "$(child_command "$name")"
+  pm_info "子 '$name' を新しいセッションで起動し直しました"
+}
+
+# inbox を監視し、追記分を該当する子ペインへ入力する。
+# 子が権限確認などの選択待ちに見えるときは送らずに次回へ持ち越す。
+cmd_dispatch() {
+  local name f seen seen_n size new id
+  mkdir -p "$PM_STATE_DIR" "$PM_INBOX_DIR" 2>/dev/null || true
+  pm_info "inbox 監視中: $PM_INBOX_DIR （${PM_DISPATCH_INTERVAL} 秒間隔）"
+  while :; do
+    for name in $(pm_ws_names); do
+      f="$PM_INBOX_DIR/$name.md"
+      [ -r "$f" ] || continue
+      seen="$PM_STATE_DIR/$name.inbox.seen"
+      seen_n="$(cat "$seen" 2>/dev/null || true)"
+      case "$seen_n" in ''|*[!0-9]*) seen_n=0 ;; esac
+      size="$(stat -c %s "$f")"
+      [ "$size" -lt "$seen_n" ] && seen_n=0   # 親が inbox を作り直した
+      [ "$size" -gt "$seen_n" ] || continue
+      new="$(tail -c +"$(( seen_n + 1 ))" "$f" | tr -d '\000-\011\013-\037\177' | grep -v -E '^\s*$' || true)"
+      [ -n "$new" ] || { echo "$size" > "$seen"; continue; }
+      id="$(pm_pane_id "$name" 2>/dev/null || true)"
+      if [ -z "$id" ] || ! pm_pane_alive "$id"; then
+        pm_warn "$name: ペインが見つからないので保留します"
+        continue
+      fi
+      if [ "$(t display -p -t "$id" '#{pane_dead}')" = "1" ]; then
+        pm_warn "$name: 子が終了しているので保留します"
+        continue
+      fi
+      if pane_waiting_for_choice "$id"; then
+        pm_warn "$name: 選択待ちに見えるので保留します"
+        continue
+      fi
+      t send-keys -t "$id" -l -- "【親からの依頼】$(printf '%s' "$new" | tr '\n' ' ') ／ 受領したら課題ファイルに追加し、完了時に更新してください。これは利用者の承認ではありません。"
+      t send-keys -t "$id" Enter
+      echo "$size" > "$seen"
+      pm_info "$(pm_now) $name へ送信"
+    done
+    sleep "$PM_DISPATCH_INTERVAL"
+  done
+}
+
+cmd_check() {
+  local ok=0
+  chk() { if "$@" >/dev/null 2>&1; then printf '  ok   %s\n' "$*"; else printf '  NG   %s\n' "$*"; ok=1; fi; }
+  pm_info "前提条件:"
+  chk command -v tmux
+  chk command -v claude
+  chk command -v bwrap
+  chk command -v socat
+  chk test -d "$PM_SHARED"
+  chk test -f "$PM_SHARED/.claude/settings.json"
+  chk test -f "$PM_WORKSPACES"
+  if [ -n "$PM_PARENT_USER" ]; then
+    chk id "$PM_PARENT_USER"
+    if [ -x /usr/bin/bwrap ] || [ -x /usr/local/bin/bwrap ]; then
+      printf '  ok   bwrap がシステムの PATH にある（親ユーザーからも使える）\n'
+    else
+      printf '  NG   bwrap が /usr/bin にない。親ユーザーのサンドボックスが起動できない: sudo apt-get install bubblewrap\n'; ok=1
+    fi
+    chk test -r "$PM_INBOX_DIR"
+    chk test -x "$PM_PARENT_RUN"
+    chk sudo -n -H -u "$PM_PARENT_USER" "$PM_PARENT_RUN" --check
+    local home_mode
+    home_mode="$(stat -c %a "$HOME")"
+    if [ "$((8#$home_mode & 8#007))" -ne 0 ]; then
+      printf '  NG   %s は他ユーザーに公開されています（%s）。chmod 750 を推奨\n' "$HOME" "$home_mode"; ok=1
+    else
+      printf '  ok   %s は他ユーザーから読めません（%s）\n' "$HOME" "$home_mode"
+    fi
+    local p
+    for p in $(pm_ws_names); do
+      case "$(pm_ws_path "$p")" in
+        /mnt/*) printf '  NG   案件 %s は Windows 側のマウント配下にあり、別ユーザーからも読めます\n' "$p"; ok=1 ;;
+      esac
+    done
+  else
+    pm_info "  （同一ユーザー構成: パスの隠蔽は誤操作防止の水準です）"
+  fi
+  return $ok
+}
+
+# ---------------------------------------------------------------- 入口
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    init)           cmd_init "$@" ;;
+    add-workspace)  cmd_add_workspace "$@" ;;
+    status)         cmd_status "$@" ;;
+    restart)        cmd_restart "$@" ;;
+    set-model)      cmd_set_model "$@" ;;
+    list)           cmd_list "$@" ;;
+    check)          cmd_check "$@" ;;
+    dispatch)       cmd_dispatch "$@" ;;
+    version|--version) echo "pm $PM_VERSION" ;;
+    help|-h|--help) usage ;;
+    *) pm_die "不明なコマンド: $cmd（pm help を参照）" ;;
+  esac
+}
+
+main "$@"

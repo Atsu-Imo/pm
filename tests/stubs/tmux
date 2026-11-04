@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# tmux の代役。呼び出しを記録し、セッションとペインの有無だけを真似る。
+set -u
+STATE="${STUB_STATE:?}"
+mkdir -p "$STATE"
+printf '%s\n' "$*" >> "$STATE/tmux.log"
+
+args=("$@")
+# -L <socket> を読み飛ばす
+if [ "${args[0]:-}" = "-L" ]; then args=("${args[@]:2}"); fi
+cmd="${args[0]:-}"
+args=("${args[@]:1}")
+
+next_pane() {
+  local n; n="$(cat "$STATE/pane_seq" 2>/dev/null || echo 0)"
+  echo $((n + 1)) > "$STATE/pane_seq"
+  echo "%$n"
+}
+has_flag() { local f; for f in "${args[@]}"; do [ "$f" = "$1" ] && return 0; done; return 1; }
+
+case "$cmd" in
+  has-session) [ -f "$STATE/session" ] || exit 1 ;;
+  new-session)
+    touch "$STATE/session"; echo main >> "$STATE/windows"
+    id="$(next_pane)"; echo "$id" >> "$STATE/panes"; has_flag -P && echo "$id" ;;
+  split-window)
+    id="$(next_pane)"; echo "$id" >> "$STATE/panes"; has_flag -P && echo "$id" ;;
+  new-window)
+    for ((i=0;i<${#args[@]};i++)); do [ "${args[$i]}" = "-n" ] && echo "${args[$((i+1))]}" >> "$STATE/windows"; done
+    id="$(next_pane)"; echo "$id" >> "$STATE/panes"; has_flag -P && echo "$id" ;;
+  list-panes)
+    if has_flag -F && printf '%s' "$*" | grep -q pane_start_command; then
+      cat "$STATE/pane_cmds" 2>/dev/null
+    else
+      cat "$STATE/panes" 2>/dev/null
+    fi ;;
+  list-windows) cat "$STATE/windows" 2>/dev/null ;;
+  display) echo "${STUB_PANE_DEAD:-0}" ;;
+  capture-pane) cat "$STATE/screen" 2>/dev/null ;;
+  respawn-pane|send-keys|select-pane|select-layout|select-window|set-option|attach-session|switch-client|kill-session) ;;
+  *) ;;
+esac
+exit 0

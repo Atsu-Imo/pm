@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# claude の代役。引数と作業ディレクトリを記録して終了する。
+printf 'cwd=%s\nargs=%s\n' "$PWD" "$*" >> "${STUB_STATE:?}/claude.log"
+exit 0

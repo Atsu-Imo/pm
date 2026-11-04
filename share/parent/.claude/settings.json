@@ -1,0 +1,49 @@
+{
+  "model": "opus",
+  "crossSessionInbound": "refuse",
+  "permissions": {
+    "allow": [
+      "Read(//{{SHARED}}/status/**)",
+      "Read(//{{SHARED}}/inbox/**)",
+      "Read(//{{SHARED}}/workspaces.txt)",
+      "Edit(//{{SHARED}}/inbox/**)",
+      "Bash(date *)",
+      "Bash(date)"
+    ],
+    "deny": [
+      "ListAgents",
+      "SendMessage",
+      "Read(~/.config/pm/**)",
+      "Read(~/.claude/projects/**)",
+      "Read(~/.claude/jobs/**)",
+      "Read(~/.claude/sessions/**)",
+      "Read(~/.claude/history.jsonl)",
+      "Edit(//{{SHARED}}/status/**)",
+      "Edit(//{{SHARED}}/CLAUDE.md)",
+      "Edit(//{{SHARED}}/workspaces.txt)",
+      "Edit(//{{SHARED}}/.claude/**)",
+      "Bash(tmux *)",
+      "Bash(tmux)",
+      "Bash(pm *)",
+      "Bash(pm)",
+      "Bash(pm-* *)",
+      "Bash(sudo *)",
+      "Bash(su *)",
+      "Bash(claude *)",
+      "Bash(claude)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": [
+        "~/.config/pm",
+        "~/.claude/projects",
+        "~/.claude/jobs",
+        "~/.claude/sessions"
+      ]
+    }
+  }
+}
